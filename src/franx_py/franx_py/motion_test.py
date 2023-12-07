@@ -1,6 +1,6 @@
 import rclpy
 import rclpy.node
-import math
+from sensor_msgs.msg import JointState
 import traceback
 from argparse import ArgumentParser
 from dataclasses import dataclass
@@ -113,6 +113,21 @@ class MotionPlaner(rclpy.node.Node):
         ## For record motion setting
         self.is_recording = False
 
+        ## For publish to Isaac sim ##
+        self.joint_state_pub = self.create_publisher(JointState, "joint_command", 10)
+        self.joint_state = JointState()
+        self.joint_state.name = [
+            "panda_joint1",
+            "panda_joint2",
+            "panda_joint3",
+            "panda_joint4",
+            "panda_joint5",
+            "panda_joint6",
+            "panda_joint7",
+            "panda_finger_joint1",
+            "panda_finger_joint2",
+        ]
+
         ## Set Robot arm parameter ##
         self.robot = Robot(self.args.host)
         self.robot.set_default_behavior()
@@ -129,6 +144,11 @@ class MotionPlaner(rclpy.node.Node):
         # self.apriltag_detector = AprilTagDetector()
         self.base_pos = None
         self.stop_following = False
+    
+    def pubToTopic(self, joints_pos):
+        """input 7 axis joints position """ 
+        self.joint_state.header.stamp = self.get_clock().now().to_msg()
+        self.joint_state.position = joints_pos
 
     @staticmethod
     def get_base(x, y, z, roll = 0.0, pitch = 0.0, yaw = 0.0): 
@@ -152,14 +172,14 @@ class MotionPlaner(rclpy.node.Node):
         else:
             print("record not start yet")
 
-    def recordPoseTrajectory(self, collect_freq = 10):
+    def recordPoseTrajectory(self, collect_freq = 100):
         """Default collect frequency is 10hz"""
         while self.is_recording:
             self.record_pose.append(self.robot.current_pose())
             print("Record pose: {}, {}, {}".format(self.robot.current_pose().x, self.robot.current_pose().y, self.robot.current_pose().z))
             time.sleep(1 / collect_freq) 
 
-    def replayRecordTrajectory(self, record_pos_list, motion_type = "Linear", cycle = 1):
+    def replayRecordTrajectory(self, record_pos_list, motion_type = "Linear", dt = 0.5, cycle = 1):
         """support follow waypoints and impedence trajectory"""
         if len(record_pos_list) != 0:
             if motion_type == "Linear":
@@ -169,14 +189,14 @@ class MotionPlaner(rclpy.node.Node):
                             print("Fail to move target point: {}, {}, {}".format(pose.x, pose.y, pose.z))
                             break
             elif motion_type == "Impedence":
-                impedance_motion = ImpedanceMotion(400.0, 30.0) # translational stiffness, rotational stiffness
+                impedance_motion = ImpedanceMotion(400, 30) # translational stiffness, rotational stiffness
                 execute_thread = self.robot.move_async(impedance_motion)
-                time.sleep(0.1)
+                time.sleep(0.5)
                 for _ in range(cycle):
                     for pose in record_pos_list:
                         print('target: ', impedance_motion.target)
                         impedance_motion.target = pose
-                        time.sleep(0.5) # operation frequency 2hz
+                        time.sleep(dt) # operation frequency 2hz
                 impedance_motion.finish()
                 execute_thread.join()
             # self.record_pose = [] # reset record list
@@ -225,7 +245,7 @@ class MotionPlaner(rclpy.node.Node):
         print('O_TT_E: ', self.robot_state.O_T_EE)
         print('Joints: ', self.robot_state.q)
         print('Elbow: ', self.robot_state.elbow)
-        # return state
+        return self.robot_state
     
     def setGraspObjPos(self):
         if len(self.record_pose) != 0:
@@ -271,8 +291,9 @@ class MotionPlaner(rclpy.node.Node):
     def putBackCup(self):
         if self.put_pos is not None:
             self.replayRecordTrajectory(self.put_pos)
+            self.openGripper()
 
-    def pollWater(self, cycle):
+    def pollWater(self, cycle=1):
         if self.poll_pos is not None:
             self.replayRecordTrajectory(self.poll_pos, motion_type='Impedence', cycle=cycle)
 
@@ -357,9 +378,8 @@ class MotionPlaner(rclpy.node.Node):
         pass
     
     def test(self):
-        self.pollWater(1)
-        # if self.getCup():
-        #     self.readyPos()
+        if self.getCup():
+            self.readyPos()
             # Stage 1 ##
             # self.pollWater(3)
             # self.readyPos()
@@ -372,7 +392,6 @@ class MotionPlaner(rclpy.node.Node):
             # self.pollWater(6)
             # self.readyPos()
             # self.putBackCup()
-            # self.openGripper()
             # self.moveToHome()
         
 
@@ -380,6 +399,14 @@ class MotionPlaner(rclpy.node.Node):
         #     self.replayRecordTrajectory()
         #     self.openGripper()
         # self.moveToHome()
+    
+    def testPoll(self):
+        self.pollWater()
+        # if self.getCup():
+        #     self.readyPos()
+        #     self.pollWater(2)
+        #     self.putBackCup()
+        #     self.moveToHome()
 
     def goToBaseFrame(self):
         tag_pos = self.apriltag_detector.getTagPosition()
@@ -430,8 +457,8 @@ def main():
         "grasp": controller.setGraspObjPos,
         "poll": controller.setPollPos,
         "set": controller.recordPose,
-        "rectraj": controller.startRecordTraj,
-        "stoprec": controller.stopRecordTraj,
+        "r": controller.startRecordTraj,
+        "s": controller.stopRecordTraj,
         "ready": controller.setReadyPos,
         "put": controller.setPutCup,
         "base": controller.goToBaseFrame,
@@ -441,6 +468,7 @@ def main():
         "save": controller.saveParameter,
         "load": controller.loadParameter,
         "coffee": controller.pollCoffee,
+        "pt": controller.testPoll,
     }
     while True:
         try:
