@@ -127,6 +127,8 @@ class MotionPlaner(rclpy.node.Node):
             "panda_finger_joint1",
             "panda_finger_joint2",
         ]
+        num_joints = len(self.joint_state.name)
+        self.joint_state.position = np.array([0.0] * num_joints, dtype=np.float64).tolist()
 
         ## Set Robot arm parameter ##
         self.robot = Robot(self.args.host)
@@ -145,10 +147,16 @@ class MotionPlaner(rclpy.node.Node):
         self.base_pos = None
         self.stop_following = False
     
-    def pubToTopic(self, joints_pos):
+    def pubToTopic(self, joints_pos, gripper_pos = [0.0, 0.0]):
         """input 7 axis joints position """ 
         self.joint_state.header.stamp = self.get_clock().now().to_msg()
-        self.joint_state.position = joints_pos
+        g_pos = np.hstack((joints_pos, gripper_pos))
+        self.joint_state.position = g_pos.tolist()
+        self.joint_state_pub.publish(self.joint_state)
+    
+    def AffineInverse(self, affine, q = [0, -0.796, 0, -2.329, 0, 1.53, 0.785], elbow = [0, -1.0]):
+        null_space = NullSpaceHandling(int(elbow[0]), elbow[1])
+        return Kinematics.inverse(affine.vector(), q, null_space)
 
     @staticmethod
     def get_base(x, y, z, roll = 0.0, pitch = 0.0, yaw = 0.0): 
@@ -181,27 +189,29 @@ class MotionPlaner(rclpy.node.Node):
 
     def replayRecordTrajectory(self, record_pos_list, motion_type = "Linear", dt = 0.5, cycle = 1):
         """support follow waypoints and impedence trajectory"""
-        if len(record_pos_list) != 0:
-            if motion_type == "Linear":
-                for _ in range(cycle):
-                    for pose in record_pos_list:
-                        if not self.moveToTarget(pose, "Linear"):
-                            print("Fail to move target point: {}, {}, {}".format(pose.x, pose.y, pose.z))
-                            break
-            elif motion_type == "Impedence":
-                impedance_motion = ImpedanceMotion(400, 30) # translational stiffness, rotational stiffness
-                execute_thread = self.robot.move_async(impedance_motion)
-                time.sleep(0.5)
-                for _ in range(cycle):
-                    for pose in record_pos_list:
-                        print('target: ', impedance_motion.target)
-                        impedance_motion.target = pose
-                        time.sleep(dt) # operation frequency 2hz
-                impedance_motion.finish()
-                execute_thread.join()
-            # self.record_pose = [] # reset record list
-        else:
+        if len(record_pos_list) == 0:
             print("Record pose list is empty")
+            return
+        q = self.getRobotState().q
+        if motion_type == "Linear":
+            for _ in range(cycle):
+                for pose in record_pos_list:
+                    if not self.moveToTarget(pose, "Linear"):
+                        print("Fail to move target point: {}, {}, {}".format(pose.x, pose.y, pose.z))
+                        break
+        elif motion_type == "Impedence":
+            impedance_motion = ImpedanceMotion(400, 30) # translational stiffness, rotational stiffness
+            execute_thread = self.robot.move_async(impedance_motion)
+            time.sleep(0.5)
+            for _ in range(cycle):
+                for pose in record_pos_list:
+                    print('target: ', impedance_motion.target)
+                    impedance_motion.target = pose
+                    self.pubToTopic(self.AffineInverse(pose))
+                    time.sleep(dt) # operation frequency 2hz
+            impedance_motion.finish()
+            execute_thread.join()
+        # self.record_pose = [] # reset record list
     
     def clearRecordTrajectory(self):
         self.record_pose = []
@@ -221,30 +231,35 @@ class MotionPlaner(rclpy.node.Node):
             self.robot.recover_from_errors()
             print("Fail to move target point: {}, {}, {}".format(pose.x, pose.y, pose.z))
             return False
+        self.pubToTopic(self.getRobotState().q)
         return True
     
     def moveToHome(self):
+        home_pos = [0, -0.796, 0, -2.329, 0, 1.53, 0.785]
         # self.robot.move(JointMotion([0, -0.25 * math.pi, 0, -0.725 * math.pi, 0, 0.5 * math.pi, 0.25 * math.pi]))
-        self.robot.move(JointMotion([0, -0.796, 0, -2.329, 0, 1.53, 0.785]))
+        self.pubToTopic(home_pos)
+        self.robot.move(JointMotion(home_pos))
         # self.robot.move(LinearMotion(self.get_base(0, 0, 0)))
         print("Return to Initial pose complete")
 
     def openGripper(self):
         self.gripper.move(self.GRIPPER_MAX_WIDTH)
+        self.pubToTopic(self.getRobotState().q, [0.3, 0.3])
         
     def closeGripper(self):
         is_grasp = self.gripper.clamp()
         if is_grasp:
             print("object grasp sucess")
             return True
+        self.pubToTopic(self.getRobotState().q, [0, 0])
         return False
         
     def getRobotState(self):
         self.robot_state = self.robot.read_once()
-        print('\nPose: ', self.robot.current_pose())
-        print('O_TT_E: ', self.robot_state.O_T_EE)
-        print('Joints: ', self.robot_state.q)
-        print('Elbow: ', self.robot_state.elbow)
+        # print('\nPose: ', self.robot.current_pose())
+        # print('O_TT_E: ', self.robot_state.O_T_EE)
+        # print('Joints: ', self.robot_state.q)
+        # print('Elbow: ', self.robot_state.elbow)
         return self.robot_state
     
     def setGraspObjPos(self):
@@ -293,9 +308,9 @@ class MotionPlaner(rclpy.node.Node):
             self.replayRecordTrajectory(self.put_pos)
             self.openGripper()
 
-    def pollWater(self, cycle=1):
+    def pollWater(self, cycle=1, dt = 0.5):
         if self.poll_pos is not None:
-            self.replayRecordTrajectory(self.poll_pos, motion_type='Impedence', cycle=cycle)
+            self.replayRecordTrajectory(self.poll_pos, motion_type='Impedence', dt=dt, cycle=cycle)
 
     def readyPos(self):
         if self.ready_pos is not None:
@@ -304,10 +319,10 @@ class MotionPlaner(rclpy.node.Node):
     def saveParameter(self):
         param = CoffeeParameter()
         try:
-            param.ready_pos = self.AffineToPose(self.ready_pos)
-            param.grasp_pos = self.AffineToPose(self.grasp_pos)
-            param.poll_pos = self.AffineToPose(self.poll_pos)
-            param.put_pos = self.AffineToPose(self.put_pos)
+            param.ready_pos = self.AffineToPoses(self.ready_pos)
+            param.grasp_pos = self.AffineToPoses(self.grasp_pos)
+            param.poll_pos = self.AffineToPoses(self.poll_pos)
+            param.put_pos = self.AffineToPoses(self.put_pos)
             file_name = "coffee_param"
             with open(file_name, 'wb+') as f:
                 pickle.dump(param, f)
@@ -326,7 +341,7 @@ class MotionPlaner(rclpy.node.Node):
         except Exception as e:
             print("Fail to load parameter")
     
-    def AffineToPose(self, affine_list):
+    def AffineToPoses(self, affine_list):
         pose_list = []
         for affine in affine_list:
             pose = [affine.x, affine.y, affine.z, affine.a, affine.b, affine.c]
@@ -401,7 +416,7 @@ class MotionPlaner(rclpy.node.Node):
         # self.moveToHome()
     
     def testPoll(self):
-        self.pollWater()
+        self.pollWater(dt=0.01, cycle=1)
         # if self.getCup():
         #     self.readyPos()
         #     self.pollWater(2)
